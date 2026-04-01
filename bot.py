@@ -496,22 +496,32 @@ async def handle_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
             total_submissions = base_count
             conn.commit()
 
-            msg = await safe_send_message(
-                context.bot,
-                chat_id=ADMIN_GROUP_CHAT_ID,
-                text=(
-                    f"📧 <b>New Email Submission</b>\n\n"
-                    f"From: {html_escape(db_user['full_name'])} ({html_escape(username_display)})\n"
-                    f"Bank: {html_escape(db_user['bank_name'])} — {html_escape(db_user['account_no'])}\n"
-                    f"Email: <code>{html_escape(email)}</code>\n"
-                    f"Status: <b>Unclaimed</b>\n"
-                    f"Total submissions by this user: {total_submissions}\n"
-                    f"Submission ID: #{submission_id}"
-                ),
-                parse_mode="HTML",
-            )
-            conn.execute("UPDATE submissions SET group_msg_id=? WHERE id=?", (msg.message_id, submission_id))
-            conn.commit()
+            msg = None
+            try:
+                msg = await safe_send_message(
+                    context.bot,
+                    chat_id=ADMIN_GROUP_CHAT_ID,
+                    text=(
+                        f"📧 <b>New Email Submission</b>\n\n"
+                        f"From: {html_escape(db_user['full_name'])} ({html_escape(username_display)})\n"
+                        f"Bank: {html_escape(db_user['bank_name'])} — {html_escape(db_user['account_no'])}\n"
+                        f"Email: <code>{html_escape(email)}</code>\n"
+                        f"Status: <b>Unclaimed</b>\n"
+                        f"Total submissions by this user: {total_submissions}\n"
+                        f"Submission ID: #{submission_id}"
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to deliver submission %s to admin group chat %s.",
+                    email,
+                    ADMIN_GROUP_CHAT_ID,
+                )
+
+            if msg:
+                conn.execute("UPDATE submissions SET group_msg_id=? WHERE id=?", (msg.message_id, submission_id))
+                conn.commit()
 
     user_message = [f"✅ Submitted {len(accepted_emails)} email(s) for review."]
     if skipped_emails:
