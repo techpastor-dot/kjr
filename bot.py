@@ -484,6 +484,8 @@ async def handle_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     db_user = get_user(user.id)
     username_display = f"@{user.username}" if user.username else f"ID:{user.id}"
+    any_group_delivery_failed = False
+    any_admin_fallback_sent = False
     with get_db() as conn:
         base_count = conn.execute("SELECT COUNT(*) FROM submissions WHERE user_id=?", (user.id,)).fetchone()[0]
         for email in accepted_emails:
@@ -497,6 +499,7 @@ async def handle_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.commit()
 
             msg = None
+            group_delivery_failed = False
             try:
                 msg = await safe_send_message(
                     context.bot,
@@ -513,14 +516,42 @@ async def handle_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="HTML",
                 )
             except Exception:
+                group_delivery_failed = True
+                any_group_delivery_failed = True
                 logger.exception(
                     "Failed to deliver submission %s to admin group chat %s.",
                     email,
                     ADMIN_GROUP_CHAT_ID,
                 )
+                if ADMIN_USER_IDS:
+                    for admin_id in ADMIN_USER_IDS:
+                        try:
+                            await safe_send_message(
+                                context.bot,
+                                chat_id=admin_id,
+                                text=(
+                                    f"📧 <b>New Email Submission (Admin DM Fallback)</b>\n\n"
+                                    f"From: {html_escape(db_user['full_name'])} ({html_escape(username_display)})\n"
+                                    f"Bank: {html_escape(db_user['bank_name'])} — {html_escape(db_user['account_no'])}\n"
+                                    f"Email: <code>{html_escape(email)}</code>\n"
+                                    f"Status: <b>Unclaimed</b>\n"
+                                    f"Submission ID: #{submission_id}"
+                                ),
+                                parse_mode="HTML",
+                            )
+                            any_admin_fallback_sent = True
+                        except Exception:
+                            logger.exception(
+                                "Failed to deliver fallback admin DM for submission %s to user %s.",
+                                email,
+                                admin_id,
+                            )
 
             if msg:
                 conn.execute("UPDATE submissions SET group_msg_id=? WHERE id=?", (msg.message_id, submission_id))
+                conn.commit()
+            elif group_delivery_failed:
+                conn.execute("UPDATE submissions SET group_msg_id=NULL WHERE id=?", (submission_id,))
                 conn.commit()
 
     user_message = [f"✅ Submitted {len(accepted_emails)} email(s) for review."]
@@ -528,6 +559,14 @@ async def handle_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_message.append("⚠️ These were already submitted: " + ", ".join(skipped_emails))
     if invalid_tokens or invalid_emails:
         user_message.append("❌ Invalid values: " + ", ".join(invalid_tokens + invalid_emails))
+    if any_group_delivery_failed:
+        if any_admin_fallback_sent:
+            user_message.append("⚠️ Admin group notification failed, but admins were notified directly.")
+        else:
+            user_message.append(
+                "⚠️ Submission received, but admin group notification failed. "
+                "Please ask the owner to check the group configuration."
+            )
     await safe_reply_text(update.message, "\n\n".join(user_message), parse_mode="Markdown")
 
 
@@ -1238,10 +1277,10 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^/balance(?:\s|$)") & filters.ChatType.PRIVATE, balance))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, profile_update_text
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_email
     ))
     app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_email
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, profile_update_text
     ))
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & ~filters.ChatType.PRIVATE,
