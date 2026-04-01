@@ -1,0 +1,11 @@
+# Python
+*.pyc
+__pycache__/
+
+# Virtual environment
+.venv/
+
+# Local files
+bot.log
+jkr_bot.db
+.env
