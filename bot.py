@@ -1291,6 +1291,7 @@ def main():
     app.add_handler(CommandHandler("request", handle_request_mail, filters=filters.ChatType.PRIVATE))
     app.add_handler(MessageHandler(filters.Regex(r"^/request(?:\s|$)") & filters.ChatType.PRIVATE, handle_request_mail))
     app.add_handler(CommandHandler("customer_stats", customer_stats))
+    app.add_handler(MessageHandler(filters.Regex(r"^/customer\-stats(?:\s|$)"), customer_stats))
     app.add_handler(CommandHandler("add_worker", add_worker, filters=filters.Chat(ADMIN_GROUP_CHAT_ID)))
     app.add_handler(MessageHandler(filters.Regex(r"^/add\-worker(?:\s|$)") & filters.Chat(ADMIN_GROUP_CHAT_ID), add_worker))
     app.add_handler(CommandHandler("delete_worker", delete_worker, filters=filters.Chat(ADMIN_GROUP_CHAT_ID)))
