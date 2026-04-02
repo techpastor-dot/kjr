@@ -323,12 +323,45 @@ def parse_email_batch(text: str):
 
 
 worker_reminder_tasks = {}
+pending_request_messages = {}
 
 
 def cancel_worker_reminder(submission_id: int):
     task = worker_reminder_tasks.pop(submission_id, None)
     if task is not None:
         task.cancel()
+
+
+def add_pending_request_message(submission_id: int, chat_id: int, message_id: int):
+    pending_request_messages.setdefault(submission_id, []).append((chat_id, message_id))
+
+
+def clear_pending_request_messages(submission_id: int):
+    return pending_request_messages.pop(submission_id, [])
+
+
+async def invalidate_pending_request_messages(bot, submission_id: int, claimer_username: str, claimer_id: int):
+    messages = clear_pending_request_messages(submission_id)
+    for chat_id, message_id in messages:
+        text = (
+            f"✅ This mail has been claimed by @{html_escape(claimer_username)}."
+            if chat_id == claimer_id else
+            f"⚠️ This mail was claimed by @{html_escape(claimer_username)} and is no longer available."
+        )
+        try:
+            await safe_edit_chat_message(
+                bot,
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                parse_mode="HTML",
+            )
+        except Exception:
+            logger.exception(
+                "Failed to invalidate pending request message %s for submission %s.",
+                message_id,
+                submission_id,
+            )
 
 
 async def worker_reminder_loop(bot, submission_id: int, worker_id: int, worker_username: str):
@@ -625,27 +658,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.commit()
         db_user = get_user(sub["user_id"])
 
-        group_text = (
-            f"📧 <b>New Email Submission</b>\n\n"
-            f"From: {html_escape(db_user['full_name'])} ({html_escape(db_user['username'] or f'ID:{db_user['user_id']}')})\n"
-            f"Bank: {html_escape(db_user['bank_name'])} — {html_escape(db_user['account_no'])}\n"
-            f"Email: <code>{html_escape(sub['email'])}</code>\n"
-            f"Status: <b>Claimed by @{html_escape(worker_username)}</b>\n"
-            f"Submission ID: #{sub_id}"
-        )
-        if sub["group_msg_id"]:
-            await safe_edit_chat_message(
-                context.bot,
-                chat_id=ADMIN_GROUP_CHAT_ID,
-                message_id=sub["group_msg_id"],
-                text=group_text,
-                parse_mode="HTML",
-            )
+            await invalidate_pending_request_messages(context.bot, sub_id, worker_username, user_id)
 
-        action_keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("✅ Done", callback_data=f"process|{sub_id}|done"),
-                InlineKeyboardButton("❌ Incorrect Password", callback_data=f"process|{sub_id}|incorrect_password"),
             ],
             [
                 InlineKeyboardButton("❌ Not Found", callback_data=f"process|{sub_id}|not_found"),
@@ -977,12 +991,11 @@ async def handle_request_mail(update: Update, context: ContextTypes.DEFAULT_TYPE
         [InlineKeyboardButton("Claim", callback_data=f"claim|{submission['id']}")]
     ])
 
-    await safe_reply_text(
+    msg = await safe_reply_text(
         update.message,
         (
             f"📨 <b>Unclaimed Mail</b>\n\n"
             f"Email: <code>{html_escape(submission['email'])}</code>\n"
-            f"Submitter: {html_escape(submission['full_name'])} ({html_escape(submission['submitter_username'] or f'ID:{submission['user_id']}')})\n"
             f"Submission ID: #{submission['id']}\n"
             f"Status: <b>Unclaimed</b>\n\n"
             f"Press Claim to assign it to yourself."
@@ -990,6 +1003,8 @@ async def handle_request_mail(update: Update, context: ContextTypes.DEFAULT_TYPE
         parse_mode="HTML",
         reply_markup=keyboard,
     )
+
+    add_pending_request_message(submission['id'], update.effective_chat.id, msg.message_id)
 
 
 async def worker_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1051,12 +1066,31 @@ async def worker_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def customer_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != ADMIN_GROUP_CHAT_ID:
-        return
     user_id = update.effective_user.id
-    if ADMIN_USER_IDS and user_id not in ADMIN_USER_IDS:
-        await safe_reply_text(update.message, "You are not authorized to view customer stats.")
+    if update.effective_chat.type == 'private':
+        if ADMIN_USER_IDS and user_id not in ADMIN_USER_IDS:
+            await safe_reply_text(update.message, "You are not authorized to view customer stats.")
+            return
+    elif update.effective_chat.id != ADMIN_GROUP_CHAT_ID:
         return
+    else:
+        if ADMIN_USER_IDS and user_id not in ADMIN_USER_IDS:
+            await safe_reply_text(update.message, "You are not authorized to view customer stats.")
+            return
+
+    target_day = datetime.now().strftime("%Y-%m-%d")
+    args = update.message.text.strip().split(maxsplit=1)
+    if len(args) > 1 and args[1].strip():
+        requested_day = args[1].strip()
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", requested_day):
+            target_day = requested_day
+        else:
+            await safe_reply_text(
+                update.message,
+                "❌ Invalid date format. Use /customer_stats YYYY-MM-DD or send the command with no date for today.",
+                parse_mode="HTML",
+            )
+            return
 
     with get_db() as conn:
         rows = conn.execute(
@@ -1067,52 +1101,46 @@ async def customer_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 u.full_name,
                 u.bank_name,
                 u.account_no,
-                DATE(s.submitted_at) as day,
-                SUM(CASE WHEN s.status='approved' THEN 1 ELSE 0 END) as done_count,
-                SUM(CASE WHEN s.status='incorrect_password' THEN 1 ELSE 0 END) as incorrect_count,
-                SUM(CASE WHEN s.status='not_found' THEN 1 ELSE 0 END) as not_found_count,
-                SUM(CASE WHEN s.status='approved' THEN 1 ELSE 0 END) * ? as pending_amount
+                COUNT(s.id) as approved_count
             FROM submissions s
             JOIN users u ON u.user_id = s.user_id
-            WHERE s.paid=0 AND s.status IN ('approved','incorrect_password','not_found')
-            GROUP BY u.user_id, day
-            ORDER BY day DESC, u.user_id
+            WHERE s.paid=0 AND s.status='approved' AND DATE(s.submitted_at)=?
+            GROUP BY u.user_id
+            ORDER BY approved_count DESC
             """,
-            (PAYMENT_PER_EMAIL,),
+            (target_day,),
         ).fetchall()
 
     if not rows:
-        await safe_reply_text(update.message, "No pending customer payments found.")
+        await safe_reply_text(
+            update.message,
+            f"📊 <b>Daily Payout Summary</b>\n\nNo approved unpaid mails found for <b>{html_escape(target_day)}</b>.",
+            parse_mode="HTML",
+        )
         return
 
-    await safe_reply_text(update.message, "📊 <b>Customer Payment Stats</b>", parse_mode="HTML")
-
+    lines = [
+        f"📊 <b>Daily Payout Summary</b>\n\nDate: <b>{html_escape(target_day)}</b>\n",
+    ]
+    total_count = 0
+    total_amount = 0
     for row in rows:
+        approved_count = row["approved_count"] or 0
+        amount = approved_count * PAYMENT_PER_EMAIL
+        total_count += approved_count
+        total_amount += amount
         username_display = f"@{row['username']}" if row['username'] else f"ID:{row['user_id']}"
-        done = row['done_count'] or 0
-        incorrect = row['incorrect_count'] or 0
-        not_found = row['not_found_count'] or 0
-        pending_amount = row['pending_amount'] or 0
-        text = (
-            f"Customer: {html_escape(username_display)}\n"
-            f"Bank: {html_escape(row['bank_name'] or 'N/A')}\n"
-            f"Account: {html_escape(row['account_no'] or 'N/A')}\n"
-            f"Day: {html_escape(row['day'])}\n"
-            f"✅ Done: {done}\n"
-            f"❌ Incorrect Password: {incorrect}\n"
-            f"❌ Not Found: {not_found}\n"
-            f"💰 Pending Payment: ₦{pending_amount:,}"
+        lines.append(
+            f"👤 {html_escape(username_display)} — {approved_count} mail(s) — ₦{amount:,}\n"
+            f"   Bank: {html_escape(row['bank_name'] or 'N/A')} — {html_escape(row['account_no'] or 'N/A')}\n"
         )
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Mark as Paid", callback_data=f"markpaid|{row['user_id']}|{row['day']}")]
-        ])
-        await safe_send_message(
-            context.bot,
-            chat_id=user_id,
-            text=text,
-            parse_mode="HTML",
-            reply_markup=keyboard,
-        )
+
+    lines.append(
+        f"\n<b>Total mails:</b> {total_count}\n"
+        f"<b>Total payout:</b> ₦{total_amount:,}"
+    )
+
+    await safe_reply_text(update.message, "\n".join(lines), parse_mode="HTML")
 
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1267,8 +1295,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^/worker\-stats(?:\s|$)") & filters.Chat(ADMIN_GROUP_CHAT_ID), worker_stats))
     app.add_handler(CommandHandler("request", handle_request_mail, filters=filters.ChatType.PRIVATE))
     app.add_handler(MessageHandler(filters.Regex(r"^/request(?:\s|$)") & filters.ChatType.PRIVATE, handle_request_mail))
-    app.add_handler(CommandHandler("customer_stats", customer_stats, filters=filters.Chat(ADMIN_GROUP_CHAT_ID)))
-    app.add_handler(MessageHandler(filters.Regex(r"^/customer\-stats(?:\s|$)") & filters.Chat(ADMIN_GROUP_CHAT_ID), customer_stats))
+    app.add_handler(CommandHandler("customer_stats", customer_stats))
     app.add_handler(CommandHandler("add_worker", add_worker, filters=filters.Chat(ADMIN_GROUP_CHAT_ID)))
     app.add_handler(MessageHandler(filters.Regex(r"^/add\-worker(?:\s|$)") & filters.Chat(ADMIN_GROUP_CHAT_ID), add_worker))
     app.add_handler(CommandHandler("delete_worker", delete_worker, filters=filters.Chat(ADMIN_GROUP_CHAT_ID)))
