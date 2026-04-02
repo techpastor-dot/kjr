@@ -340,9 +340,11 @@ def clear_pending_request_messages(submission_id: int):
     return pending_request_messages.pop(submission_id, [])
 
 
-async def invalidate_pending_request_messages(bot, submission_id: int, claimer_username: str, claimer_id: int):
+async def invalidate_pending_request_messages(bot, submission_id: int, claimer_username: str, claimer_id: int, exclude_message_id: int = None):
     messages = clear_pending_request_messages(submission_id)
     for chat_id, message_id in messages:
+        if exclude_message_id is not None and message_id == exclude_message_id:
+            continue
         text = (
             f"✅ This mail has been claimed by @{html_escape(claimer_username)}."
             if chat_id == claimer_id else
@@ -658,49 +660,37 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.commit()
         db_user = get_user(sub["user_id"])
 
-            await invalidate_pending_request_messages(context.bot, sub_id, worker_username, user_id)
+            await invalidate_pending_request_messages(
+                context.bot,
+                sub_id,
+                worker_username,
+                user_id,
+                exclude_message_id=query.message.message_id,
+            )
 
-            ],
-            [
-                InlineKeyboardButton("❌ Not Found", callback_data=f"process|{sub_id}|not_found"),
-            ],
-        ])
+            action_keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Done", callback_data=f"process|{sub_id}|done"),
+                    InlineKeyboardButton("❌ Incorrect Password", callback_data=f"process|{sub_id}|incorrect_password"),
+                ],
+                [
+                    InlineKeyboardButton("❌ Not Found", callback_data=f"process|{sub_id}|not_found"),
+                ],
+            ])
 
-        await safe_send_message(
-            context.bot,
-            chat_id=user_id,
-            text=(
-                f"🛠️ <b>Mail Claimed</b>\n\n"
-                f"Email: <code>{html_escape(sub['email'])}</code>\n"
-                f"Submission ID: #{sub_id}\n"
-                f"Please choose the correct result for this mail."
-            ),
-            parse_mode="HTML",
-            reply_markup=action_keyboard,
-        )
-        schedule_worker_reminder(context.bot, sub_id, user_id, worker_username)
-        return
-
-    if action == "editprofile":
-        context.user_data["profile_edit"] = "name"
-        await safe_send_message(
-            context.bot,
-            chat_id=user_id,
-            text="🔄 Send your updated full name as it appears on your bank account.",
-            parse_mode="HTML",
-        )
-        await safe_edit_message_text(
-            query,
-            "✏️ Profile edit started. Please check your private chat.",
-            parse_mode="HTML",
-        )
-        return
-
-    if action == "process":
-        sub_id = int(parts[1]) if len(parts) > 1 else None
-        result = parts[2] if len(parts) > 2 else None
-        with get_db() as conn:
-            sub = conn.execute("SELECT * FROM submissions WHERE id=?", (sub_id,)).fetchone()
+            await safe_edit_message_text(
+                query,
+                (
+                    f"🛠️ <b>Mail Claimed</b>\n\n"
+                    f"Email: <code>{html_escape(sub['email'])}</code>\n"
+                    f"Submission ID: #{sub_id}\n"
+                    f"Please choose the correct result for this mail."
+                ),
+                parse_mode="HTML",
+                reply_markup=action_keyboard,
+            )
+            schedule_worker_reminder(context.bot, sub_id, user_id, worker_username)
+            return
         if not sub:
             await safe_edit_message_text(query, "⚠️ Submission not found.")
             return
