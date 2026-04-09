@@ -1,95 +1,160 @@
-# JKR Mail Submission Bot — Setup Guide
+# JKR Mail Submission Bot
 
-## 1. Prerequisites
+Telegram bot for collecting Gmail submissions, letting workers process them, and handling daily payouts with confirmation and notifications.
+
+## What It Does
+
+- Registers customers with bank details (`/start`)
+- Accepts Gmail submissions that contain `jkr`
+- Lets workers claim and process mails as:
+  - Done
+  - Incorrect Password
+  - Not Found
+- Tracks balances and stats
+- Sends daily payout summary at 6:00 PM
+- Adds an admin `PAID ✅` button to confirm payouts and notify all listed customers
+- Tracks single-owner referral earnings for TechPastor
+
+## Requirements
+
 - Python 3.10+
-- A VPS (or local machine for testing)
-- A Telegram bot token from @BotFather
-- Your admin Telegram group ID
+- Telegram bot token from @BotFather
+- Admin group where payout/work activity is managed
 
----
-
-## 2. Installation
+## Install
 
 ```bash
-# Clone or upload the bot files to your VPS
-cd jkr_bot
-
-# Install dependencies
 pip install -r requirements.txt
 ```
 
----
+## Config (`config.py`)
 
-## 3. Configuration
-
-Open `config.py` and fill in:
+Set these values:
 
 ```python
-BOT_TOKEN = "your_token_from_botfather"
-ADMIN_GROUP_ID = -1001234567890   # How to get this: see below
+BOT_TOKEN = "..."
+ADMIN_GROUP_ID = -100...
+ADMIN_USER_IDS = []
+WORKER_USER_IDS = []
 PAYMENT_PER_EMAIL = 200
 ```
 
-### How to get your Group ID:
-1. Add @userinfobot to your Telegram group
-2. It will print the group's ID (starts with -100...)
-3. Paste that into `config.py`
+Notes:
+- `ADMIN_USER_IDS = []` means any member in the admin group can use admin-only callbacks.
+- Worker access is role-based in the database (`/add-worker`, `/delete-worker`).
 
-### Important: Add your bot to the group
-- Add the bot as an admin in your Telegram group
-- It needs permission to send messages
+## Main Flow
 
----
+### 1) Customer onboarding
 
-## 4. Run the bot
+- User sends `/start`
+- Bot collects:
+  - Full name
+  - Bank name + account number
+- User is stored in SQLite (`users`)
+
+### 2) Customer submissions
+
+- Customer sends one or more emails in private chat
+- Bot validates:
+  - valid email format
+  - `@gmail.com`
+  - contains `jkr`
+  - batch size <= 20
+- New valid mails are inserted as `pending`
+
+### 3) Worker processing
+
+- Worker sends `/request` in private chat
+- Bot returns oldest unclaimed mail with `Claim`
+- After claim, worker gets action buttons:
+  - `Done`
+  - `Incorrect Password`
+  - `Not Found`
+- Customer is notified after processing
+
+### 4) Daily payout confirmation
+
+- At 6:00 PM the bot posts **Daily Payout Summary** in admin group
+- Summary includes `PAID ✅` button
+- When admin taps `PAID ✅`:
+  - all approved/unpaid submissions for that date are marked paid
+  - each listed customer gets a payment notification
+  - each customer gets a `View Details` button
+
+## Commands
+
+### Customer (private)
+
+- `/start`
+- `/profile`
+- `/stats`
+- `/balance`
+
+### Worker
+
+- `/request` (private)
+
+### Admin
+
+- `/customer_stats [YYYY-MM-DD]`
+- `/worker_stats`
+- `/add-worker @username`
+- `/delete-worker @username`
+
+### Owner (TechPastor, private)
+
+- `/my_referral_stats` or `/my-referral-stats`
+- `/withdraw_referrals` or `/withdraw-referrals`
+
+## Referral System (Single Owner)
+
+Only one referrer exists: **TechPastor**.
+
+Referral entry link format:
+
+```text
+https://t.me/<YourBotUsername>?start=techpastor
+```
+
+Behavior:
+- If a user joins with `start=techpastor`, user is tagged `referred_by="techpastor"`
+- Referred users are shown as `⭐ Referred User` in profile
+- Every successful mail (`Done` => `approved`) from referred users creates one owner earning row
+
+### Referral earning rules
+
+- Rate: `₦50` per successful mail
+- Stored in `owner_referral_earnings`
+- Duplicate protection: one earning per mail (`mail_id` is unique)
+- Status lifecycle: `pending` -> `paid` (via owner withdrawal)
+
+### Owner withdrawal flow
+
+- Owner sends `/withdraw-referrals`
+- Bot shows pending total with `Confirm` / `Cancel`
+- Confirm marks all pending referral earnings as paid
+- Withdrawal is logged in `owner_referral_withdrawals`
+
+## Database
+
+SQLite file: `jkr_bot.db`
+
+Main tables:
+- `users`
+- `submissions`
+- `owner_referral_earnings`
+- `owner_referral_withdrawals`
+
+## Run
 
 ```bash
 python bot.py
 ```
 
-### Run with PM2 (recommended for VPS):
-```bash
-npm install -g pm2
-pm2 start bot.py --interpreter python3 --name jkr-bot
-pm2 save
-pm2 startup
-```
+## Persistence / Redeploy Notes
 
----
-
-## 5. How it works
-
-### Users:
-- `/start` → enter name + bank details → registered
-- Send any Gmail with `jkr` in it → submitted for review
-- `/stats` → see their approved/pending/rejected counts and pending payout
-
-### You (admin group):
-- Each submission arrives with ✅ Approve / ❌ Reject buttons
-- Approve → user gets notified, email queued for 6PM payout
-- Reject → type the reason in the group chat → user gets notified with reason
-
-### 6PM daily:
-- Bot posts a full payout summary in your group
-- Shows: name, bank, account number, email count, amount owed
-- You pay manually, bot marks them as paid automatically
-
----
-
-## 6. File structure
-
-```
-jkr_bot/
-├── bot.py          # Main bot logic
-├── config.py       # Your tokens and settings
-├── requirements.txt
-├── jkr_bot.db      # Auto-created SQLite database
-└── README.md
-```
-
----
-
-## 7. Notes
-- Duplicate emails (already pending or approved) are automatically blocked
-- The database file `jkr_bot.db` holds all user data — back it up regularly
-- Payments from previous days that weren't processed carry over to the next summary
+- Data is stored in `jkr_bot.db`.
+- Pushing code to GitHub does **not** clear mails.
+- Redeploying does **not** clear mails **unless** `jkr_bot.db` is deleted/replaced or you deploy on ephemeral storage.
+- Keep regular DB backups.

@@ -43,6 +43,8 @@ def html_escape(text: str) -> str:
     return html.escape(str(text), quote=False)
 
 ADMIN_GROUP_CHAT_ID = ADMIN_GROUP_ID
+OWNER_REFERRAL_TAG = "techpastor"
+OWNER_REFERRAL_RATE = 50
 
 async def safe_send_message(bot, *args, retries=2, delay=1.5, **kwargs):
     global ADMIN_GROUP_CHAT_ID
@@ -104,6 +106,7 @@ def init_db():
                 bank_name TEXT,
                 account_no TEXT,
                 role TEXT DEFAULT 'customer',
+                referred_by TEXT,
                 registered_at TEXT DEFAULT (datetime('now'))
             )
         """)
@@ -123,6 +126,25 @@ def init_db():
                 paid_at TEXT
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS owner_referral_earnings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                customer_id INTEGER NOT NULL,
+                mail_id INTEGER NOT NULL UNIQUE,
+                amount INTEGER NOT NULL,
+                status TEXT DEFAULT 'pending',
+                created_at TEXT DEFAULT (datetime('now')),
+                paid_at TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS owner_referral_withdrawals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                amount INTEGER NOT NULL,
+                mail_count INTEGER NOT NULL,
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
         apply_db_migrations(conn)
         conn.commit()
 
@@ -131,6 +153,8 @@ def apply_db_migrations(conn):
     existing_user_columns = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
     if "role" not in existing_user_columns:
         conn.execute("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'customer'")
+    if "referred_by" not in existing_user_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN referred_by TEXT")
 
     existing_submission_columns = {row[1] for row in conn.execute("PRAGMA table_info(submissions)").fetchall()}
     if "assigned_worker_id" not in existing_submission_columns:
@@ -141,6 +165,156 @@ def apply_db_migrations(conn):
         conn.execute("ALTER TABLE submissions ADD COLUMN processed_at TEXT")
     if "paid_at" not in existing_submission_columns:
         conn.execute("ALTER TABLE submissions ADD COLUMN paid_at TEXT")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS owner_referral_earnings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL,
+            mail_id INTEGER NOT NULL UNIQUE,
+            amount INTEGER NOT NULL,
+            status TEXT DEFAULT 'pending',
+            created_at TEXT DEFAULT (datetime('now')),
+            paid_at TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS owner_referral_withdrawals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            amount INTEGER NOT NULL,
+            mail_count INTEGER NOT NULL,
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_owner_referral_mail_unique ON owner_referral_earnings(mail_id)"
+    )
+
+
+def is_owner_user(user) -> bool:
+    return (user.username or "").lower() == OWNER_REFERRAL_TAG
+
+
+def is_referred_by_owner(user_row) -> bool:
+    if not user_row:
+        return False
+    return (user_row["referred_by"] or "").lower() == OWNER_REFERRAL_TAG
+
+
+def upsert_user_profile(user, full_name: str, bank_name: str, account_no: str, referred_by: str = None):
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO users
+            (user_id, username, full_name, bank_name, account_no, role, referred_by)
+            VALUES
+            (?, ?, ?, ?, ?, COALESCE((SELECT role FROM users WHERE user_id=?), 'customer'),
+             COALESCE((SELECT referred_by FROM users WHERE user_id=?), ?))
+            """,
+            (
+                user.id,
+                user.username,
+                full_name,
+                bank_name.strip(),
+                account_no.strip(),
+                user.id,
+                user.id,
+                referred_by,
+            ),
+        )
+        conn.commit()
+
+
+def maybe_tag_user_as_referred(user_id: int, payload: str):
+    if payload != OWNER_REFERRAL_TAG:
+        return
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE users SET referred_by=? WHERE user_id=? AND (referred_by IS NULL OR referred_by='')",
+            (OWNER_REFERRAL_TAG, user_id),
+        )
+        conn.commit()
+
+
+def credit_owner_referral_earning(mail_id: int) -> bool:
+    with get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT s.user_id, u.referred_by
+            FROM submissions s
+            JOIN users u ON u.user_id = s.user_id
+            WHERE s.id=?
+            """,
+            (mail_id,),
+        ).fetchone()
+        if not row:
+            return False
+        if (row["referred_by"] or "").lower() != OWNER_REFERRAL_TAG:
+            return False
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO owner_referral_earnings (customer_id, mail_id, amount, status)
+            VALUES (?, ?, ?, 'pending')
+            """,
+            (row["user_id"], mail_id, OWNER_REFERRAL_RATE),
+        )
+        inserted = conn.execute("SELECT changes()").fetchone()[0] > 0
+        conn.commit()
+        return inserted
+
+
+def get_daily_unpaid_customer_rows(target_day: str):
+    with get_db() as conn:
+        return conn.execute(
+            """
+            SELECT
+                u.user_id,
+                u.username,
+                u.full_name,
+                u.bank_name,
+                u.account_no,
+                COUNT(s.id) as approved_count
+            FROM submissions s
+            JOIN users u ON u.user_id = s.user_id
+            WHERE s.paid=0 AND s.status='approved' AND DATE(s.submitted_at)=?
+            GROUP BY u.user_id
+            ORDER BY approved_count DESC
+            """,
+            (target_day,),
+        ).fetchall()
+
+
+def build_daily_payout_summary(target_day: str, rows):
+    if not rows:
+        return (
+            f"📊 <b>Daily Payout Summary</b>\n\nNo approved unpaid mails found for <b>{html_escape(target_day)}</b>.",
+            0,
+            0,
+            0,
+        )
+    lines = [
+        f"📊 <b>Daily Payout Summary</b>\n\nDate: <b>{html_escape(target_day)}</b>\n",
+    ]
+    total_customers = len(rows)
+    total_count = 0
+    total_amount = 0
+    for row in rows:
+        approved_count = row["approved_count"] or 0
+        amount = approved_count * PAYMENT_PER_EMAIL
+        total_count += approved_count
+        total_amount += amount
+        username_display = f"@{row['username']}" if row["username"] else f"ID:{row['user_id']}"
+        lines.append(
+            f"👤 {html_escape(username_display)} — {approved_count} mail(s) — ₦{amount:,}\n"
+            f"   Bank: {html_escape(row['bank_name'] or 'N/A')} — {html_escape(row['account_no'] or 'N/A')}\n"
+        )
+
+    lines.append(
+        f"\n<b>Total customers:</b> {total_customers}\n"
+        f"<b>Total mails:</b> {total_count}\n"
+        f"<b>Total payout:</b> ₦{total_amount:,}\n\n"
+        "After bank transfer, tap <b>PAID ✅</b> to mark these payouts as paid and notify customers."
+    )
+    return "\n".join(lines), total_customers, total_count, total_amount
 
 
 def is_registered(user_id):
@@ -158,13 +332,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     logger.info("/start from user %s (%s)", user.id, user.username)
     user_id = user.id
+    start_payload = ""
+    if context.args:
+        start_payload = (context.args[0] or "").strip().lower()
+        if start_payload == OWNER_REFERRAL_TAG:
+            context.user_data["referred_by"] = OWNER_REFERRAL_TAG
+
     if is_registered(user_id):
+        maybe_tag_user_as_referred(user_id, start_payload)
+        db_user = get_user(user_id)
+        referred_note = (
+            "\n\n⭐ Referral tag active: Referred by TechPastor."
+            if is_referred_by_owner(db_user)
+            else ""
+        )
         await safe_reply_text(
             update.message,
-            "👋 Welcome back! Send me a Gmail with *jkr* in it to submit.\n\nExample: `andysalmonjkr@gmail.com`",
+            "👋 Welcome back! Send me a Gmail with *jkr* in it to submit.\n\nExample: `andysalmonjkr@gmail.com`"
+            + referred_note,
             parse_mode="Markdown",
         )
         return ConversationHandler.END
+
     await safe_reply_text(
         update.message,
         "👋 Welcome to the *JKR Mail Submission Bot*!\n\nBefore you start, I need your payment details.\n\nPlease enter your *full name* as it appears on your bank account:",
@@ -199,12 +388,10 @@ async def ask_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bank_name, account_no = parts
     user = update.effective_user
     full_name = context.user_data.get("full_name")
-    with get_db() as conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO users (user_id, username, full_name, bank_name, account_no, role) VALUES (?, ?, ?, ?, ?, COALESCE((SELECT role FROM users WHERE user_id=?), 'customer'))",
-            (user.id, user.username, full_name, bank_name.strip(), account_no.strip(), user.id),
-        )
-        conn.commit()
+    referred_by = context.user_data.pop("referred_by", None)
+    upsert_user_profile(user, full_name, bank_name, account_no, referred_by=referred_by)
+    db_user = get_user(user.id)
+
     if context.user_data.get("update_profile"):
         context.user_data.pop("update_profile", None)
         await safe_reply_text(
@@ -213,9 +400,11 @@ async def ask_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
         )
         return ConversationHandler.END
+
+    referral_line = "\n⭐ Referred User: Yes" if is_referred_by_owner(db_user) else ""
     await safe_reply_text(
         update.message,
-        f"✅ *Registered successfully!*\n\nName: {context.user_data['full_name']}\nBank: {bank_name.strip()}\nAccount: {account_no.strip()}\n\nYou'll receive ₦{PAYMENT_PER_EMAIL:,} per approved email. Payments go out daily at 6PM.\n\nNow send me a Gmail with *jkr* in it to get started!",
+        f"✅ *Registered successfully!*\n\nName: {context.user_data['full_name']}\nBank: {bank_name.strip()}\nAccount: {account_no.strip()}{referral_line}\n\nYou'll receive ₦{PAYMENT_PER_EMAIL:,} per approved email. Payments go out daily at 6PM.\n\nNow send me a Gmail with *jkr* in it to get started!",
         parse_mode="Markdown",
     )
     return ConversationHandler.END
@@ -244,7 +433,8 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Name: {html_escape(user['full_name'] or 'N/A')}\n"
         f"Bank: {html_escape(user['bank_name'] or 'N/A')}\n"
         f"Account: {html_escape(user['account_no'] or 'N/A')}\n"
-        f"Username: {html_escape(username_display)}"
+        f"Username: {html_escape(username_display)}\n"
+        f"Referral: {'⭐ Referred User' if is_referred_by_owner(user) else 'None'}"
     )
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("Edit", callback_data="editprofile")]
@@ -260,7 +450,7 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def profile_update_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != 'private':
         return
-    if not context.user_data.get("profile_edit"): 
+    if not context.user_data.get("profile_edit"):
         return
 
     if context.user_data.get("profile_edit") == "name":
@@ -287,12 +477,7 @@ async def profile_update_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         bank_name, account_no = parts
         user = update.effective_user
         full_name = context.user_data.get("full_name")
-        with get_db() as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO users (user_id, username, full_name, bank_name, account_no, role) VALUES (?, ?, ?, ?, ?, COALESCE((SELECT role FROM users WHERE user_id=?), 'customer'))",
-                (user.id, user.username, full_name, bank_name.strip(), account_no.strip(), user.id),
-            )
-            conn.commit()
+        upsert_user_profile(user, full_name, bank_name, account_no)
 
         context.user_data.pop("profile_edit", None)
         context.user_data.pop("full_name", None)
@@ -612,7 +797,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = parts[0]
     user_id = query.from_user.id
 
-    if action in {"approve", "reject", "markpaid"}:
+    if action in {"approve", "reject", "markpaid", "markpaidbatch"}:
         if ADMIN_USER_IDS and user_id not in ADMIN_USER_IDS:
             await query.answer("You are not authorized to perform this action.", show_alert=True)
             return
@@ -632,12 +817,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_registered(user_id):
             await query.answer("Register first with /start.", show_alert=True)
             return
+    elif action == "withdrawrefs":
+        if not is_owner_user(query.from_user):
+            await query.answer("Only TechPastor can use this action.", show_alert=True)
+            return
     else:
         await query.answer("Unknown action.", show_alert=True)
         return
 
     logger.info("handle_callback from user %s: %s", user_id, data)
     await query.answer()
+
+    if action == "editprofile":
+        db_user = get_user(user_id)
+        context.user_data["profile_edit"] = "name"
+        context.user_data["full_name"] = db_user["full_name"] if db_user else ""
+        await safe_edit_message_text(
+            query,
+            "📝 Send your updated *full name* as it appears on your bank account.",
+            parse_mode="Markdown",
+        )
+        return
 
     if action == "claim":
         sub_id = int(parts[1]) if len(parts) > 1 else None
@@ -724,8 +924,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 (new_status, sub_id),
             )
             conn.commit()
-        db_user = get_user(sub["user_id"])
 
+        if new_status == "approved":
+            credit_owner_referral_earning(sub_id)
+
+        db_user = get_user(sub["user_id"])
         group_text = (
             f"📧 <b>New Email Submission</b>\n\n"
             f"From: {html_escape(db_user['full_name'])} ({html_escape(db_user['username'] or f'ID:{db_user['user_id']}')})\n"
@@ -770,6 +973,136 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_message_text(
             query,
             f"{status_text} — Submission #{sub_id} has been processed.",
+            parse_mode="HTML",
+        )
+        return
+
+    if action == "markpaidbatch":
+        target_day = parts[1].strip() if len(parts) > 1 and parts[1].strip() else datetime.now().strftime("%Y-%m-%d")
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", target_day):
+            await safe_edit_message_text(query, "⚠️ Invalid payout date.")
+            return
+
+        with get_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    u.user_id,
+                    u.username,
+                    COUNT(s.id) as approved_count
+                FROM submissions s
+                JOIN users u ON u.user_id = s.user_id
+                WHERE s.paid=0 AND s.status='approved' AND DATE(s.submitted_at)=?
+                GROUP BY u.user_id
+                ORDER BY approved_count DESC
+                """,
+                (target_day,),
+            ).fetchall()
+
+            if not rows:
+                await safe_edit_message_text(
+                    query,
+                    f"⚠️ No pending approved mails found for <b>{html_escape(target_day)}</b>.",
+                    parse_mode="HTML",
+                )
+                return
+
+            total_customers = len(rows)
+            total_mails = sum((row["approved_count"] or 0) for row in rows)
+            total_amount = total_mails * PAYMENT_PER_EMAIL
+
+            conn.execute(
+                "UPDATE submissions SET paid=1, paid_at=datetime('now') WHERE status='approved' AND paid=0 AND DATE(submitted_at)=?",
+                (target_day,),
+            )
+            conn.commit()
+
+        notified = 0
+        notify_failed = 0
+        for row in rows:
+            user_amount = (row["approved_count"] or 0) * PAYMENT_PER_EMAIL
+            view_keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("View Details", callback_data=f"viewdetails|{row['user_id']}|{target_day}")]
+            ])
+            try:
+                await safe_send_message(
+                    context.bot,
+                    chat_id=row["user_id"],
+                    text=(
+                        f"💰 <b>Payment Update</b>\n\n"
+                        f"Your payout for <b>{html_escape(target_day)}</b> has been paid ✅\n"
+                        f"Approved mails: {row['approved_count']}\n"
+                        f"Amount paid: <b>₦{user_amount:,}</b>\n\n"
+                        "Tap below to view details."
+                    ),
+                    parse_mode="HTML",
+                    reply_markup=view_keyboard,
+                )
+                notified += 1
+            except Exception:
+                notify_failed += 1
+                logger.exception("Failed to notify paid customer %s for date %s", row["user_id"], target_day)
+
+        actor_display = f"@{query.from_user.username}" if query.from_user.username else str(user_id)
+        await safe_edit_message_text(
+            query,
+            (
+                f"✅ <b>PAID Recorded</b>\n\n"
+                f"Date: <b>{html_escape(target_day)}</b>\n"
+                f"Customers: {total_customers}\n"
+                f"Mails: {total_mails}\n"
+                f"Total paid: <b>₦{total_amount:,}</b>\n"
+                f"Customers notified: {notified}\n"
+                f"Notification failures: {notify_failed}\n"
+                f"Marked by: {html_escape(actor_display)}"
+            ),
+            parse_mode="HTML",
+        )
+        return
+
+    if action == "withdrawrefs":
+        decision = parts[1] if len(parts) > 1 else ""
+        if decision == "cancel":
+            await safe_edit_message_text(query, "Withdrawal cancelled.")
+            return
+
+        if decision != "confirm":
+            await safe_edit_message_text(query, "Invalid withdrawal action.")
+            return
+
+        with get_db() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) as pending_count,
+                    COALESCE(SUM(amount), 0) as pending_amount
+                FROM owner_referral_earnings
+                WHERE status='pending'
+                """
+            ).fetchone()
+            pending_count = row["pending_count"] or 0
+            pending_amount = row["pending_amount"] or 0
+
+            if pending_count == 0:
+                await safe_edit_message_text(query, "No pending referral earnings to withdraw.")
+                return
+
+            conn.execute(
+                "UPDATE owner_referral_earnings SET status='paid', paid_at=datetime('now') WHERE status='pending'"
+            )
+            conn.execute(
+                "INSERT INTO owner_referral_withdrawals (amount, mail_count) VALUES (?, ?)",
+                (pending_amount, pending_count),
+            )
+            conn.commit()
+
+        await safe_edit_message_text(
+            query,
+            (
+                "✅ <b>Referral Withdrawal Successful</b>\n\n"
+                f"Successful mails settled: {pending_count}\n"
+                f"Amount withdrawn: <b>₦{pending_amount:,}</b>"
+            ),
             parse_mode="HTML",
         )
         return
@@ -869,6 +1202,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with get_db() as conn:
             conn.execute("UPDATE submissions SET status='approved' WHERE id=?", (sub_id,))
             conn.commit()
+        credit_owner_referral_earning(sub_id)
         await safe_edit_message_text(
             query,
             f"✅ <b>Approved</b> — #{sub_id}\nEmail: <code>{html_escape(sub['email'])}</code>\nUser: {html_escape(db_user['full_name'])}",
@@ -923,39 +1257,28 @@ async def handle_rejection_reason(update: Update, context: ContextTypes.DEFAULT_
 
 async def send_payout_summary(bot):
     today = datetime.now().strftime("%Y-%m-%d")
-    with get_db() as conn:
-        rows = conn.execute("""
-            SELECT u.full_name, u.bank_name, u.account_no, u.user_id, COUNT(s.id) as count
-            FROM submissions s
-            JOIN users u ON u.user_id = s.user_id
-            WHERE s.status='approved' AND s.paid=0 AND DATE(s.submitted_at) = ?
-            GROUP BY s.user_id
-        """, (today,)).fetchall()
+    rows = get_daily_unpaid_customer_rows(today)
+    summary_text, _, _, _ = build_daily_payout_summary(today, rows)
+
     if not rows:
         await safe_send_message(
             bot,
             chat_id=ADMIN_GROUP_CHAT_ID,
-            text="📊 <b>Daily Payout Summary</b>\n\nNo approved unpaid submissions today.",
+            text=summary_text,
             parse_mode="HTML",
         )
         return
-    lines = [f"📊 <b>Daily Payout Summary — {html_escape(today)}</b>\n"]
-    total = 0
-    for row in rows:
-        amount = row["count"] * PAYMENT_PER_EMAIL
-        total += amount
-        lines.append(
-            f"👤 {html_escape(row['full_name'])}\n"
-            f"   Bank: {html_escape(row['bank_name'])} — {html_escape(row['account_no'])}\n"
-            f"   Emails: {row['count']} × ₦{PAYMENT_PER_EMAIL:,} = <b>₦{amount:,}</b>\n"
-        )
-    lines.append(f"\n<b>💰 Total to pay: ₦{total:,}</b>")
-    await safe_send_message(bot, chat_id=ADMIN_GROUP_CHAT_ID, text="\n".join(lines), parse_mode="HTML")
-    with get_db() as conn:
-        conn.execute(
-            "UPDATE submissions SET paid=1 WHERE status='approved' AND paid=0 AND DATE(submitted_at)=?", (today,)
-        )
-        conn.commit()
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("PAID ✅", callback_data=f"markpaidbatch|{today}")]
+    ])
+    await safe_send_message(
+        bot,
+        chat_id=ADMIN_GROUP_CHAT_ID,
+        text=summary_text,
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
 
 
 async def handle_request_mail(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1087,55 +1410,104 @@ async def customer_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-    with get_db() as conn:
-        rows = conn.execute(
-            """
-            SELECT
-                u.user_id,
-                u.username,
-                u.full_name,
-                u.bank_name,
-                u.account_no,
-                COUNT(s.id) as approved_count
-            FROM submissions s
-            JOIN users u ON u.user_id = s.user_id
-            WHERE s.paid=0 AND s.status='approved' AND DATE(s.submitted_at)=?
-            GROUP BY u.user_id
-            ORDER BY approved_count DESC
-            """,
-            (target_day,),
-        ).fetchall()
+    rows = get_daily_unpaid_customer_rows(target_day)
+    summary_text, _, _, _ = build_daily_payout_summary(target_day, rows)
 
     if not rows:
-        await safe_reply_text(
-            update.message,
-            f"📊 <b>Daily Payout Summary</b>\n\nNo approved unpaid mails found for <b>{html_escape(target_day)}</b>.",
-            parse_mode="HTML",
-        )
+        await safe_reply_text(update.message, summary_text, parse_mode="HTML")
         return
 
-    lines = [
-        f"📊 <b>Daily Payout Summary</b>\n\nDate: <b>{html_escape(target_day)}</b>\n",
-    ]
-    total_count = 0
-    total_amount = 0
-    for row in rows:
-        approved_count = row["approved_count"] or 0
-        amount = approved_count * PAYMENT_PER_EMAIL
-        total_count += approved_count
-        total_amount += amount
-        username_display = f"@{row['username']}" if row['username'] else f"ID:{row['user_id']}"
-        lines.append(
-            f"👤 {html_escape(username_display)} — {approved_count} mail(s) — ₦{amount:,}\n"
-            f"   Bank: {html_escape(row['bank_name'] or 'N/A')} — {html_escape(row['account_no'] or 'N/A')}\n"
-        )
-
-    lines.append(
-        f"\n<b>Total mails:</b> {total_count}\n"
-        f"<b>Total payout:</b> ₦{total_amount:,}"
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("PAID ✅", callback_data=f"markpaidbatch|{target_day}")]
+    ])
+    await safe_reply_text(
+        update.message,
+        summary_text,
+        parse_mode="HTML",
+        reply_markup=keyboard,
     )
 
-    await safe_reply_text(update.message, "\n".join(lines), parse_mode="HTML")
+
+async def my_referral_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != 'private':
+        await safe_reply_text(update.message, "Use this command in private chat with the bot.")
+        return
+    if not is_owner_user(update.effective_user):
+        await safe_reply_text(update.message, "Only TechPastor can use this command.")
+        return
+
+    with get_db() as conn:
+        referred_users = conn.execute(
+            "SELECT COUNT(*) as count FROM users WHERE lower(COALESCE(referred_by, ''))=?",
+            (OWNER_REFERRAL_TAG,),
+        ).fetchone()["count"]
+        earnings = conn.execute(
+            """
+            SELECT
+                COUNT(*) as successful_mails,
+                SUM(CASE WHEN status='pending' THEN amount ELSE 0 END) as pending_earnings,
+                SUM(CASE WHEN status='paid' THEN amount ELSE 0 END) as paid_earnings
+            FROM owner_referral_earnings
+            """
+        ).fetchone()
+
+    successful_mails = earnings["successful_mails"] or 0
+    pending_earnings = earnings["pending_earnings"] or 0
+    paid_earnings = earnings["paid_earnings"] or 0
+
+    await safe_reply_text(
+        update.message,
+        (
+            "<b>Referral Earnings Summary</b>\n\n"
+            f"Total Referred Users: {referred_users}\n"
+            f"Successful Mails: {successful_mails}\n"
+            f"Pending Earnings: ₦{pending_earnings:,}\n"
+            f"Paid Earnings: ₦{paid_earnings:,}\n\n"
+            f"Rate per successful mail: ₦{OWNER_REFERRAL_RATE}"
+        ),
+        parse_mode="HTML",
+    )
+
+
+async def withdraw_referrals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != 'private':
+        await safe_reply_text(update.message, "Use this command in private chat with the bot.")
+        return
+    if not is_owner_user(update.effective_user):
+        await safe_reply_text(update.message, "Only TechPastor can use this command.")
+        return
+
+    with get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                COUNT(*) as pending_count,
+                COALESCE(SUM(amount), 0) as pending_amount
+            FROM owner_referral_earnings
+            WHERE status='pending'
+            """
+        ).fetchone()
+
+    pending_count = row["pending_count"] or 0
+    pending_amount = row["pending_amount"] or 0
+    if pending_count == 0:
+        await safe_reply_text(update.message, "No pending referral earnings to withdraw.")
+        return
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Confirm", callback_data="withdrawrefs|confirm")],
+        [InlineKeyboardButton("Cancel", callback_data="withdrawrefs|cancel")],
+    ])
+    await safe_reply_text(
+        update.message,
+        (
+            "You are about to withdraw:\n\n"
+            f"Total Earnings: ₦{pending_amount:,}\n"
+            f"Successful mails: {pending_count}"
+        ),
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
 
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1292,6 +1664,10 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^/request(?:\s|$)") & filters.ChatType.PRIVATE, handle_request_mail))
     app.add_handler(CommandHandler("customer_stats", customer_stats))
     app.add_handler(MessageHandler(filters.Regex(r"^/customer\-stats(?:\s|$)"), customer_stats))
+    app.add_handler(CommandHandler("my_referral_stats", my_referral_stats, filters=filters.ChatType.PRIVATE))
+    app.add_handler(MessageHandler(filters.Regex(r"^/my\-referral\-stats(?:\s|$)") & filters.ChatType.PRIVATE, my_referral_stats))
+    app.add_handler(CommandHandler("withdraw_referrals", withdraw_referrals, filters=filters.ChatType.PRIVATE))
+    app.add_handler(MessageHandler(filters.Regex(r"^/withdraw\-referrals(?:\s|$)") & filters.ChatType.PRIVATE, withdraw_referrals))
     app.add_handler(CommandHandler("add_worker", add_worker, filters=filters.Chat(ADMIN_GROUP_CHAT_ID)))
     app.add_handler(MessageHandler(filters.Regex(r"^/add\-worker(?:\s|$)") & filters.Chat(ADMIN_GROUP_CHAT_ID), add_worker))
     app.add_handler(CommandHandler("delete_worker", delete_worker, filters=filters.Chat(ADMIN_GROUP_CHAT_ID)))
@@ -1300,10 +1676,10 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^/balance(?:\s|$)") & filters.ChatType.PRIVATE, balance))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_email
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, profile_update_text
     ))
     app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, profile_update_text
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_email
     ))
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & ~filters.ChatType.PRIVATE,
