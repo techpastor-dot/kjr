@@ -1676,10 +1676,10 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^/balance(?:\s|$)") & filters.ChatType.PRIVATE, balance))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, profile_update_text
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_email
     ))
     app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_email
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, profile_update_text
     ))
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & ~filters.ChatType.PRIVATE,
